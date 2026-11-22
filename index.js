@@ -67,7 +67,7 @@ async function start() {
 
 client.on('loggedOn', () => {
   console.log('Вход выполнен, запускаю буст часов...');
-  client.setPersona(SteamUser.EPersonaState.Invisible);
+  client.setPersona(SteamUser.EPersonaState.Online);
   client.gamesPlayed(GAMES);
 });
 
