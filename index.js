@@ -1,86 +1,153 @@
 const http = require('http');
 const SteamUser = require('steam-user');
-const { LoginSession, EAuthTokenPlatformType, EAuthSessionGuardType } = require('steam-session');
 
 const GAMES = [730]; // AppID игр (730 = CS2)
-const client = new SteamUser();
+const PING_INTERVAL_MS = 60 * 1000; // Раз в минуту проверяем состояние
+const RECONNECT_DELAY_MS = 10 * 1000; // Задержка перед повторным входом
 
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end('Running');
-}).listen(process.env.PORT || 3000);
+const client = new SteamUser({
+  autoRelogin: true,
+  enablePicsCache: false
+});
 
-async function start() {
-  // 1. Если токен уже сохранен — входим сразу без кода
-  if (process.env.STEAM_REFRESH_TOKEN) {
-    client.logOn({ refreshToken: process.env.STEAM_REFRESH_TOKEN });
+let isLoggedIn = false;
+let isPlayingBlocked = false;
+let reconnectTimer = null;
+let lastStartTime = Date.now();
+
+// HTTP-сервер для Render и пингера (UptimeRobot / cron-job.org)
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify({
+    status: 'ok',
+    loggedIn: isLoggedIn,
+    playingBlocked: isPlayingBlocked,
+    games: GAMES,
+    uptimeSec: Math.floor((Date.now() - lastStartTime) / 1000)
+  }));
+});
+
+server.listen(process.env.PORT || 3000, () => {
+  console.log(`HTTP-сервер запущен на порту ${process.env.PORT || 3000}`);
+});
+
+function startGames() {
+  if (!isLoggedIn) return;
+  if (isPlayingBlocked) {
+    console.log('Запуск игры отложен: активна сессия на другом устройстве.');
+    return;
+  }
+  client.setPersona(SteamUser.EPersonaState.Online);
+  client.gamesPlayed(GAMES);
+  console.log('Статус Online выставлен, игры запущены:', GAMES);
+}
+
+function scheduleReconnect(reason = 'unknown') {
+  if (reconnectTimer) return;
+  console.log(`Планирую переподключение через ${RECONNECT_DELAY_MS / 1000} сек (причина: ${reason})...`);
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    loginToSteam();
+  }, RECONNECT_DELAY_MS);
+}
+
+function loginToSteam() {
+  const refreshToken = process.env.STEAM_REFRESH_TOKEN;
+  if (!refreshToken) {
+    console.error('Критическая ошибка: не задан STEAM_REFRESH_TOKEN в Environment Variables!');
     return;
   }
 
-  // 2. Иначе входим по логину и паролю из Environment Variables
-  const accountName = process.env.STEAM_USER;
-  const password = process.env.STEAM_PASSWORD;
-
-  if (!accountName || !password) {
-    console.log('Укажи STEAM_USER и STEAM_PASSWORD в Environment Variables на Render!');
-    return;
+  try {
+    console.log('Выполняю вход в Steam по STEAM_REFRESH_TOKEN...');
+    client.logOn({
+      refreshToken: refreshToken.trim(),
+      machineName: 'render-boost'
+    });
+  } catch (err) {
+    console.error('Ошибка при вызове logOn:', err.message);
+    scheduleReconnect('logOn-exception');
   }
-
-  const session = new LoginSession(EAuthTokenPlatformType.SteamClient);
-  const startResult = await session.startWithCredentials({
-    accountName,
-    password
-  });
-
-  if (startResult.actionRequired) {
-    const codeAction = startResult.validActions.find(
-      a => a.type === EAuthSessionGuardType.DeviceCode || a.type === EAuthSessionGuardType.EmailCode
-    );
-    const pushAction = startResult.validActions.find(
-      a => a.type === EAuthSessionGuardType.DeviceConfirmation
-    );
-
-    if (process.env.STEAM_GUARD_CODE && codeAction) {
-      console.log('Отправляю код Steam Guard...');
-      await session.submitSteamGuardCode(process.env.STEAM_GUARD_CODE.trim());
-    } else if (pushAction) {
-      console.log('Подтверди вход в мобильном приложении Steam (пуш-уведомление) или добавь переменную STEAM_GUARD_CODE!');
-    } else {
-      console.log('Требуется код! Добавь переменную STEAM_GUARD_CODE со свежим 5-значным кодом из приложения Steam и нажми Manual Deploy.');
-    }
-  }
-
-  session.on('authenticated', () => {
-    console.log('\nУспешный вход! Скопируй этот токен в переменную STEAM_REFRESH_TOKEN:');
-    console.log(session.refreshToken);
-    client.logOn({ refreshToken: session.refreshToken });
-  });
-
-  session.on('timeout', () => {
-    console.log('Время ожидания подтверждения истекло.');
-  });
-
-  session.on('error', (err) => {
-    console.error('Ошибка авторизации:', err.message);
-  });
 }
 
 client.on('loggedOn', () => {
-  console.log('Вход выполнен, запускаю буст часов...');
-  client.setPersona(SteamUser.EPersonaState.Online);
-  client.gamesPlayed(GAMES);
+  isLoggedIn = true;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  console.log('Успешный вход в Steam!');
+  startGames();
 });
 
 client.on('playingState', (blocked) => {
-  if (blocked) {
-    console.log('Запущена игра на другом устройстве — буст на паузе.');
+  isPlayingBlocked = Boolean(blocked);
+  if (isPlayingBlocked) {
+    console.log('Обнаружена игра на другом устройстве — буст временно на паузе.');
   } else {
-    client.gamesPlayed(GAMES);
+    console.log('Другая игровая сессия завершена — возобновляю буст.');
+    startGames();
   }
 });
 
-client.on('error', (err) => {
-  console.error('Ошибка Steam:', err.message);
+client.on('disconnected', (eresult, msg) => {
+  isLoggedIn = false;
+  console.warn(`Отключено от Steam (код: ${eresult}${msg ? `, ${msg}` : ''}).`);
+  scheduleReconnect('disconnected');
 });
 
-start();
+client.on('error', (err) => {
+  isLoggedIn = false;
+  console.error('Ошибка клиента Steam:', err.message);
+
+  // Если токен протух или отозван — перезапуск по кругу не поможет, нужен новый токен
+  if (
+    err.eresult === SteamUser.EResult.InvalidPassword ||
+    err.eresult === SteamUser.EResult.Expired ||
+    err.eresult === SteamUser.EResult.AccessDenied ||
+    err.eresult === SteamUser.EResult.Revoked
+  ) {
+    console.error('Похоже, STEAM_REFRESH_TOKEN недействителен или протух. Обнови его в Environment Variables.');
+    return;
+  }
+
+  scheduleReconnect('steam-error');
+});
+
+// Периодическая проверка: если залогинен, но статус слетел — возвращаем обратно
+setInterval(() => {
+  if (isLoggedIn && !isPlayingBlocked) {
+    client.setPersona(SteamUser.EPersonaState.Online);
+    client.gamesPlayed(GAMES);
+  }
+}, PING_INTERVAL_MS);
+
+// Защита от падения всего процесса из-за необработанных ошибок
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  scheduleReconnect('uncaughtException');
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled Rejection:', reason);
+  scheduleReconnect('unhandledRejection');
+});
+
+// Корректное завершение при рестарте контейнера со стороны Render
+function shutdown(signal) {
+  console.log(`Получен сигнал ${signal}, аккуратно завершаю работу...`);
+  try {
+    client.gamesPlayed([]);
+    client.logOff();
+  } catch (_) {}
+  server.close(() => {
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(0), 3000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
+loginToSteam();
